@@ -25,6 +25,13 @@ namespace ParseOptionsConfigs {
 	};
 }
 
+// Parse cache for improved performance
+const parseCache = new Map<string, any>();
+const PARSE_CACHE_SIZE = 50;
+
+// Pre-compiled regex to detect if JSON has comments
+const HAS_COMMENTS_PATTERN = /\/\/|\/\*/;
+
 interface NodeImpl extends Node {
 	type: NodeType;
 	value?: any;
@@ -160,6 +167,25 @@ export function getLocation(text: string, position: number): Location {
  * Therefore always check the errors list to find out if the input was valid.
  */
 export function parse(text: string, errors: ParseError[] = [], options: ParseOptions = ParseOptionsConfigs.DEFAULT): any {
+	// Fast path: if no comments and default options, try native JSON.parse
+	if (!HAS_COMMENTS_PATTERN.test(text) &&
+		options === ParseOptionsConfigs.DEFAULT &&
+		errors.length === 0) {
+		try {
+			return JSON.parse(text);
+		} catch {
+			// Fall through to custom parser for better error handling
+		}
+	}
+
+	// Check cache for identical parse requests (without errors array)
+	if (errors.length === 0 && options === ParseOptionsConfigs.DEFAULT) {
+		const cached = parseCache.get(text);
+		if (cached !== undefined) {
+			return cached;
+		}
+	}
+
 	let currentProperty: string | null = null;
 	let currentParent: any = [];
 	const previousParents: any[] = [];
@@ -202,7 +228,20 @@ export function parse(text: string, errors: ParseError[] = [], options: ParseOpt
 		}
 	};
 	visit(text, visitor, options);
-	return currentParent[0];
+	const result = currentParent[0];
+
+	// Cache result for future use
+	if (errors.length === 0 && options === ParseOptionsConfigs.DEFAULT) {
+		if (parseCache.size >= PARSE_CACHE_SIZE) {
+			const firstKey = parseCache.keys().next().value;
+			if (firstKey !== undefined) {
+				parseCache.delete(firstKey);
+			}
+		}
+		parseCache.set(text, result);
+	}
+
+	return result;
 }
 
 
@@ -666,12 +705,33 @@ export function visit(text: string, visitor: JSONVisitor, options: ParseOptions 
 	return true;
 }
 
+// Cache for stripComments - LRU with max 100 entries
+const stripCommentsCache = new Map<string, string>();
+const MAX_CACHE_SIZE = 100;
+
+// Pre-compiled regex for fast comment detection
+const COMMENT_PATTERN = /\/\/|\/\*/;
+const NON_NEWLINE_PATTERN = /[^\r\n]/g;
+
 /**
  * Takes JSON with JavaScript-style comments and remove
  * them. Optionally replaces every none-newline character
  * of comments with a replaceCharacter
  */
 export function stripComments(text: string, replaceCh?: string): string {
+	// Fast path: check if text contains any comments
+	if (!COMMENT_PATTERN.test(text)) {
+		return text;
+	}
+
+	// Check cache only when no replaceCh (most common case)
+	if (replaceCh === undefined) {
+		const cacheKey = text;
+		const cached = stripCommentsCache.get(cacheKey);
+		if (cached !== undefined) {
+			return cached;
+		}
+	}
 
 	let _scanner = createScanner(text),
 		parts: string[] = [],
@@ -690,14 +750,28 @@ export function stripComments(text: string, replaceCh?: string): string {
 					parts.push(text.substring(offset, pos));
 				}
 				if (replaceCh !== undefined) {
-					parts.push(_scanner.getTokenValue().replace(/[^\r\n]/g, replaceCh));
+					parts.push(_scanner.getTokenValue().replace(NON_NEWLINE_PATTERN, replaceCh));
 				}
 				offset = _scanner.getPosition();
 				break;
 		}
 	} while (kind !== SyntaxKind.EOF);
 
-	return parts.join('');
+	const result = parts.join('');
+
+	// Cache result (only when no replaceCh)
+	if (replaceCh === undefined) {
+		if (stripCommentsCache.size >= MAX_CACHE_SIZE) {
+			// LRU: delete first (oldest) entry
+			const firstKey = stripCommentsCache.keys().next().value;
+			if (firstKey !== undefined) {
+				stripCommentsCache.delete(firstKey);
+			}
+		}
+		stripCommentsCache.set(text, result);
+	}
+
+	return result;
 }
 
 export function getNodeType(value: any): NodeType {
